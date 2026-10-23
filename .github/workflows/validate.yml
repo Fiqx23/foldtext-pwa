@@ -1,0 +1,40 @@
+name: Validate FoldText PWA
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Validate web app
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+          const html = fs.readFileSync('index.html', 'utf8');
+          const scripts = [...html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)]
+            .map(match => match[1]).filter(s => s.trim());
+          if (!scripts.length) throw new Error('No application script found');
+          scripts.forEach((source, i) => { new Function(source); console.log('Inline JS ' + (i + 1) + ': OK'); });
+          const manifest = JSON.parse(fs.readFileSync('manifest.json', 'utf8'));
+          for (const field of ['name', 'start_url', 'scope', 'display']) {
+            if (!manifest[field]) throw new Error('Missing manifest field: ' + field);
+          }
+          for (const icon of manifest.icons || []) {
+            const path = icon.src.replace(/^\.\//, '');
+            if (!fs.existsSync(path)) throw new Error('Missing icon: ' + path);
+          }
+          new Function(fs.readFileSync('sw.js', 'utf8'));
+          console.log('Manifest, icons and service worker: OK');
+          NODE
