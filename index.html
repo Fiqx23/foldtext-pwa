@@ -5845,71 +5845,50 @@ Daftar Tugas Contoh:
 
     let deferredPrompt = null;
 
-   let deferredPrompt = null;
-
-function initPWA() {
-  // 1. Registrasi Service Worker dengan scope relatif
-  if ('serviceWorker' in navigator && (window.location.protocol.startsWith('http') || window.location.hostname === 'localhost')) {
-    window.addEventListener('load', () => {
-      navigator.serviceWorker.register('./sw.js', { scope: './' })
-        .then((reg) => {
-          console.log('[PWA] Service Worker aktif. Scope:', reg.scope);
-        })
-        .catch((err) => {
-          console.warn('[PWA] Pendaftaran Service Worker gagal:', err);
+    function initPWA() {
+      // Daftarkan Service Worker setelah seluruh halaman selesai dimuat
+      if ('serviceWorker' in navigator && (window.location.protocol.startsWith('http') || window.location.hostname === 'localhost')) {
+        window.addEventListener('load', () => {
+          navigator.serviceWorker.register('./sw.js', { scope: './' })
+            .then((reg) => {
+              console.log('[PWA] Service Worker terdaftar. Scope:', reg.scope);
+            })
+            .catch((err) => {
+              console.warn('[PWA] Gagal mendaftarkan Service Worker:', err);
+            });
         });
-    });
-  }
+      }
 
-  // 2. Tangkap event instalasi browser (Android/Desktop)
-  window.addEventListener('beforeinstallprompt', (e) => {
-    // Cegah mini-infobar default browser agar tombol custom Anda bekerja
-    e.preventDefault();
-    deferredPrompt = e;
+      // Simpan event instalasi dan aktifkan tombol '📲 Pasang'
+      window.addEventListener('beforeinstallprompt', (e) => {
+        e.preventDefault();
+        deferredPrompt = e;
+        const installBtn = document.getElementById('pwa-install-btn');
+        if (installBtn) installBtn.style.display = 'inline-flex';
+      });
 
-    // Tampilkan tombol pasang di sidebar
-    const installBtn = document.getElementById('pwa-install-btn');
-    if (installBtn) {
-      installBtn.style.display = 'inline-flex';
+      // Hilangkan tombol otomatis saat aplikasi sudah terpasang
+      window.addEventListener('appinstalled', () => {
+        deferredPrompt = null;
+        const installBtn = document.getElementById('pwa-install-btn');
+        if (installBtn) installBtn.style.display = 'none';
+        showToast('🎉 FoldText berhasil dipasang!');
+      });
     }
-  });
 
-  // 3. Sembunyikan tombol jika aplikasi sudah terpasang
-  window.addEventListener('appinstalled', () => {
-    deferredPrompt = null;
-    const installBtn = document.getElementById('pwa-install-btn');
-    if (installBtn) {
-      installBtn.style.display = 'none';
+    async function installPWA() {
+      if (!deferredPrompt) {
+        showToast('Aplikasi sudah terpasang atau gunakan menu browser.');
+        return;
+      }
+      deferredPrompt.prompt();
+      const { outcome } = await deferredPrompt.userChoice;
+      if (outcome === 'accepted') {
+        deferredPrompt = null;
+        const installBtn = document.getElementById('pwa-install-btn');
+        if (installBtn) installBtn.style.display = 'none';
+      }
     }
-    showToast('🎉 FoldText berhasil dipasang di perangkat!');
-  });
-}
-
-// Handler tombol klik '📲 Pasang'
-async function installPWA() {
-  if (!deferredPrompt) {
-    showToast('Aplikasi sudah terpasang atau browser tidak mendukung auto-install.');
-    return;
-  }
-
-  // Tampilkan prompt bawaan sistem
-  deferredPrompt.prompt();
-
-  // Tunggu keputusan pengguna
-  const { outcome } = await deferredPrompt.userChoice;
-  if (outcome === 'accepted') {
-    console.log('[PWA] Pengguna menyetujui instalasi.');
-  } else {
-    console.log('[PWA] Pengguna membatalkan instalasi.');
-  }
-
-  // Reset prompt agar tidak memory leak
-  deferredPrompt = null;
-  const installBtn = document.getElementById('pwa-install-btn');
-  if (installBtn) {
-    installBtn.style.display = 'none';
-  }
-}
     /* ==========================================================================
        10. KEYBOARD SHORTCUTS & TAB INDENT
        ========================================================================== */
