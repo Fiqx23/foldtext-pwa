@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#111827">
+<meta name="description" content="FoldText PWA - catatan lokal cepat dan offline-first">
+<link rel="manifest" href="./manifest.json">
+<link rel="icon" href="./icon.svg" type="image/svg+xml">
+<title>FoldText PWA</title>
+<style>
+:root{color-scheme:dark;--bg:#0b0f19;--panel:#111827;--card:#1f2937;--line:#374151;--text:#f9fafb;--muted:#9ca3af;--accent:#818cf8;--danger:#f87171}
+*{box-sizing:border-box}body{margin:0;font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
+button,input,textarea{font:inherit}button{border:1px solid var(--line);background:var(--card);color:var(--text);border-radius:9px;padding:.55rem .8rem;cursor:pointer}button:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.app{min-height:100vh;display:grid;grid-template-columns:minmax(220px,300px) minmax(0,1fr)}aside{background:var(--panel);border-right:1px solid var(--line);padding:1rem;display:flex;flex-direction:column;min-height:0}
+.brand{font-size:1.2rem;font-weight:800;margin-bottom:1rem}.actions{display:flex;gap:.5rem;flex-wrap:wrap;margin-bottom:.8rem}
+input,textarea{width:100%;border:1px solid var(--line);border-radius:9px;background:var(--bg);color:var(--text);padding:.7rem}
+#search{margin-bottom:.7rem}.notes{overflow:auto;display:flex;flex-direction:column;gap:.35rem;margin-top:.5rem}.note{display:block;text-align:left;width:100%;overflow:hidden}.note.active{border-color:var(--accent);background:#252949}.note strong,.note small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.note small{color:var(--muted);font-size:.76rem}
+main{padding:clamp(1rem,3vw,2rem);min-width:0;display:flex;flex-direction:column;gap:.8rem}.top{display:flex;align-items:center;justify-content:space-between;gap:.75rem;flex-wrap:wrap}.status{font-size:.8rem;color:var(--muted)}#title{font-weight:700}#editor{flex:1;min-height:45vh;resize:vertical;line-height:1.65;tab-size:2}#empty{color:var(--muted);padding:1rem 0}#toast{position:fixed;bottom:1rem;left:50%;transform:translateX(-50%);background:var(--card);border:1px solid var(--line);padding:.65rem 1rem;border-radius:10px;display:none;max-width:90vw}
+@media(max-width:700px){.app{grid-template-columns:1fr;grid-template-rows:minmax(220px,34vh) minmax(60vh,1fr)}aside{border-right:0;border-bottom:1px solid var(--line)}.notes{max-height:20vh}main{padding:1rem}#editor{min-height:32vh}}
+</style>
+</head>
+<body>
+<div class="app">
+<aside>
+<div class="brand">FoldText <span style="font-weight:500;color:var(--muted)">PWA</span></div>
+<div class="actions"><button id="new">+ Catatan</button><button id="delete">Hapus</button><button id="export">Ekspor JSON</button><button id="importBtn">Impor JSON</button><input id="import" type="file" accept="application/json,.json" hidden></div>
+<input id="search" type="search" placeholder="Cari catatan…" autocomplete="off" aria-label="Cari catatan">
+<div class="notes" id="notes" aria-label="Daftar catatan"></div>
+<div class="status" id="count"></div>
+</aside>
+<main>
+<div class="top"><div><strong id="title">Catatan lokal</strong><div class="status" id="saved">Siap · tersimpan di perangkat</div></div><div class="actions"><button id="edit">Edit</button><button id="cloud">Status cloud</button></div></div>
+<div id="empty" hidden>Pilih atau buat catatan untuk mulai menulis.</div>
+<textarea id="editor" spellcheck="true" placeholder="Mulai menulis…" aria-label="Isi catatan"></textarea>
+<div class="status">Offline-first · Penyimpanan lokal IndexedDB · <span id="wordCount">0 kata</span></div>
+</main>
+</div>
+<div id="toast" role="status" aria-live="polite"></div>
+<script>
+(() => {
+'use strict';
+const DB_NAME='FoldTextPWA', DB_VERSION=1, STORE='notes';
+const $=id=>document.getElementById(id);
+const ui={notes:$('notes'),search:$('search'),editor:$('editor'),title:$('title'),saved:$('saved'),empty:$('empty'),count:$('count'),wordCount:$('wordCount'),toast:$('toast')};
+let db=null, notes=[], activeId=null, saveTimer=0, isDirty=false;
+const now=()=>new Date().toISOString();
+const id=()=>crypto.randomUUID?crypto.randomUUID():'ft-'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2);
+function openDB(){return new Promise((resolve,reject)=>{const req=indexedDB.open(DB_NAME,DB_VERSION);req.onupgradeneeded=()=>{const d=req.result;if(!d.objectStoreNames.contains(STORE)){const s=d.createObjectStore(STORE,{keyPath:'id'});s.createIndex('updated_at','updated_at')}};req.onsuccess=()=>{db=req.result;db.onversionchange=()=>db.close();resolve(db)};req.onerror=()=>reject(req.error)})}
+function getAll(){return new Promise((resolve,reject)=>{const r=db.transaction(STORE,'readonly').objectStore(STORE).getAll();r.onsuccess=()=>resolve(r.result||[]);r.onerror=()=>reject(r.error)})}
+function put(note){return new Promise((resolve,reject)=>{const tx=db.transaction(STORE,'readwrite');tx.objectStore(STORE).put(note);tx.oncomplete=()=>resolve();tx.onerror=()=>reject(tx.error);tx.onabort=()=>reject(tx.error||new Error('Penyimpanan dibatalkan'))})}
+function remove(noteId){return new Promise((resolve,reject)=>{const tx=db.transaction(STORE,'readwrite');tx.objectStore(STORE).delete(noteId);tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error)})}
+function toast(message){ui.toast.textContent=message;ui.toast.style.display='block';clearTimeout(toast.timer);toast.timer=setTimeout(()=>ui.toast.style.display='none',2300)}
+function titleOf(n){return (n.raw_content||'').trim().split('\n')[0]||'Catatan kosong'}
+function previewOf(n){return (n.raw_content||'').trim().split('\n').slice(1).join(' ').slice(0,110)||'Belum ada isi'}
+function renderList(){const q=ui.search.value.trim().toLocaleLowerCase();const visible=notes.filter(n=>!q||((n.raw_content||'').toLocaleLowerCase().includes(q)));const frag=document.createDocumentFragment();for(const n of visible){const b=document.createElement('button');b.className='note'+(String(n.id)===String(activeId)?' active':'');b.dataset.id=String(n.id);const title=document.createElement('strong');title.textContent=titleOf(n);const preview=document.createElement('small');preview.textContent=previewOf(n);b.append(title,preview);frag.appendChild(b)}ui.notes.replaceChildren(frag);ui.count.textContent=visible.length+' / '+notes.length+' catatan'}
+function updateStats(){const text=ui.editor.value.trim();ui.wordCount.textContent=(text?text.split(/\s+/).length:0)+' kata';ui.title.textContent=titleOf({raw_content:ui.editor.value})}
+async function persistActive(){if(!activeId||!isDirty)return;const n=notes.find(x=>String(x.id)===String(activeId));if(!n)return;n.raw_content=ui.editor.value;n.updated_at=now();isDirty=false;try{await put(n);ui.saved.textContent='Tersimpan di perangkat';renderList()}catch(e){isDirty=true;ui.saved.textContent='Gagal menyimpan';console.error(e)}}
+function scheduleSave(){isDirty=true;ui.saved.textContent='Menyimpan…';updateStats();clearTimeout(saveTimer);saveTimer=setTimeout(()=>persistActive(),250)}
+async function selectNote(noteId){if(activeId===noteId)return;await persistActive();activeId=noteId;const n=notes.find(x=>String(x.id)===String(noteId));if(!n)return;ui.editor.value=n.raw_content||'';isDirty=false;ui.title.textContent=titleOf(n);ui.saved.textContent='Tersimpan di perangkat';ui.empty.hidden=true;ui.editor.hidden=false;updateStats();renderList()}
+async function newNote(){await persistActive();const n={id:id(),folder_id:'folder_general',category:'',icon:'📝',raw_content:'Catatan Baru\n',created_at:now(),updated_at:now()};notes.unshift(n);await put(n);renderList();await selectNote(n.id);ui.editor.focus();ui.editor.setSelectionRange(ui.editor.value.length,ui.editor.value.length)}
+async function deleteActive(){if(!activeId)return;const deleted=activeId;await remove(deleted);notes=notes.filter(n=>String(n.id)!==String(deleted));activeId=null;ui.editor.value='';isDirty=false;renderList();if(notes[0])await selectNote(notes[0].id);else{ui.title.textContent='Catatan lokal';ui.empty.hidden=false;ui.editor.hidden=true}}
+async function saveAll(){await persistActive();const blob=new Blob([JSON.stringify({format:'foldtext-pwa-v1',exported_at:now(),notes},null,2)],{type:'application/json'});download(blob,'foldtext-pwa-backup.json')}
+function download(blob,name){const u=URL.createObjectURL(blob),a=document.createElement('a');a.href=u;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(u),1000)}
+async function importJSON(file){const text=await file.text();const data=JSON.parse(text);const arr=Array.isArray(data)?data:data.notes;if(!Array.isArray(arr))throw new Error('Format JSON tidak memiliki daftar notes');const map=new Map(notes.map(n=>[String(n.id),n]));for(const item of arr){if(!item||item.id==null)continue;const existing=map.get(String(item.id));const raw=String(item.raw_content??item.content??'');map.set(String(item.id),{...(existing||{}),...item,id:item.id,raw_content:raw,updated_at:item.updated_at||now(),created_at:item.created_at||now()})}notes=[...map.values()].sort((a,b)=>String(b.updated_at||'').localeCompare(String(a.updated_at||'')));for(const n of notes)await put(n);renderList();if(notes[0])await selectNote(notes[0].id);toast('Impor selesai')}
+async function boot(){ui.editor.hidden=true;ui.empty.hidden=false;ui.saved.textContent='Membuka penyimpanan lokal…';try{await openDB();notes=(await getAll()).sort((a,b)=>String(b.updated_at||'').localeCompare(String(a.updated_at||'')));if(!notes.length){const welcome={id:'ft-welcome',folder_id:'folder_general',category:'Pengenalan',icon:'📝',raw_content:'Selamat datang di FoldText PWA\n\nCatatan disimpan secara lokal. Versi ini adalah baseline ringan untuk menguji performa startup.',created_at:now(),updated_at:now()};notes=[welcome];await put(welcome)}renderList();await selectNote(notes[0].id);ui.saved.textContent='Siap · lokal-first'}catch(e){ui.saved.textContent='Penyimpanan lokal gagal';ui.empty.hidden=false;toast('Gagal membuka database lokal');console.error(e)}}
+ui.notes.addEventListener('click',e=>{const b=e.target.closest('button[data-id]');if(b)selectNote(b.dataset.id).catch(err=>console.error(err))});
+ui.search.addEventListener('input',renderList);
+ui.editor.addEventListener('input',scheduleSave);
+$('new').addEventListener('click',()=>newNote().catch(e=>toast('Gagal membuat catatan')));
+$('delete').addEventListener('click',()=>{if(confirm('Hapus catatan ini dari perangkat?'))deleteActive().catch(e=>toast('Gagal menghapus'))});
+$('edit').addEventListener('click',()=>{ui.editor.focus()});
+$('cloud').addEventListener('click',()=>toast('Baseline PWA: sinkronisasi cloud belum dihubungkan.'));
+$('export').addEventListener('click',()=>saveAll().catch(e=>toast('Ekspor gagal')));
+$('importBtn').addEventListener('click',()=>$('import').click());
+$('import').addEventListener('change',e=>{const file=e.target.files&&e.target.files[0];if(file)importJSON(file).catch(err=>toast('Impor gagal: '+err.message)).finally(()=>e.target.value='')});
+window.addEventListener('pagehide',()=>{if(saveTimer)clearTimeout(saveTimer);if(isDirty)persistActive()});
+window.addEventListener('DOMContentLoaded',()=>{if('serviceWorker'in navigator&&location.protocol==='https:'){navigator.serviceWorker.register('./sw.js').catch(console.warn)};boot()});
+})();
+</script>
+</body>
+</html>
