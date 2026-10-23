@@ -5,9 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <meta name="description" content="FoldText Lite - Aplikasi Catatan Personal Ultra-Ringan dengan Hierarki Folder & Smart Folding">
   <!-- PWA Meta & Manifest -->
- <link rel="manifest" href="./manifest.json">
-<link rel="icon" type="image/svg+xml" href="./icon.svg">
-<link rel="apple-touch-icon" href="./icon.svg">
+  <link id="manifest-placeholder" rel="manifest" href="./manifest.json">
+  <link rel="icon" type="image/svg+xml" href="./icon.svg">
+  <link rel="apple-touch-icon" href="./icon-192.png">
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -15,7 +15,7 @@
   <meta name="theme-color" content="#0b0f19">
   <title>FoldText Lite</title>
   <!-- Supabase JS Client v2 (Phase A: Cloud Foundation) -->
-  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <!-- Supabase SDK is loaded on demand after the local app shell is rendered. -->
   <style>
     :root {
       --bg-main: #f8fafc;
@@ -1768,7 +1768,36 @@
        1.05 CHANGE TRACKER & OUTBOX ENGINE (PHASE 2)
        ========================================================================== */
     const ChangeTracker = {
+      // Serialize queue updates for the same record. Multiple async save paths may
+      // overlap even though JavaScript itself runs on a single thread.
+      recordLocks: new Map(),
+      lastRecordFailure: null,
+
       async record(entity, entityId, operation) {
+        if (!entityId) return null;
+        const lockKey = `${entity}:${String(entityId)}`;
+        const previousLock = this.recordLocks.get(lockKey) || Promise.resolve();
+        let releaseLock;
+        const thisLock = new Promise(resolve => { releaseLock = resolve; });
+        this.recordLocks.set(lockKey, thisLock);
+
+        await previousLock;
+        try {
+          const result = await this._recordUnlocked(entity, entityId, operation);
+          if (result !== null && this.lastRecordFailure &&
+              this.lastRecordFailure.key === lockKey) {
+            this.lastRecordFailure = null;
+          }
+          return result;
+        } finally {
+          releaseLock();
+          if (this.recordLocks.get(lockKey) === thisLock) {
+            this.recordLocks.delete(lockKey);
+          }
+        }
+      },
+
+      async _recordUnlocked(entity, entityId, operation) {
         if (isApplyingRemoteChange || !entityId) return null;
         try {
           const allQueue = (await dbGetAll('changeQueue')) || [];
@@ -1810,46 +1839,48 @@
           const matchingEvents = allQueue.filter(item =>
             item.entity === entity && String(item.entityId) === String(entityId) && item.status !== 'synced'
           );
-          // Prefer an unresolved conflict over older duplicate pending/failed events.
-          // Ordinary edits and bootstrap reconciliation must never clear a conflict implicitly.
-          const existing = matchingEvents.find(item => item.status === 'conflict') ||
-            matchingEvents.find(item => item.status === 'held') ||
-            matchingEvents[0] || null;
+          const activeEvents = matchingEvents.filter(item =>
+            item.status === 'pending' || item.status === 'failed'
+          );
+          const conflictEvent = matchingEvents.find(item => item.status === 'conflict') || null;
+          const heldEvent = matchingEvents.find(item => item.status === 'held') || null;
+
+          // Retire duplicate *active* outbox events only. Never delete conflict/held
+          // records here: they carry state that must remain under explicit control.
+          const removeExtraActiveEvents = async (keepId = null) => {
+            for (const queued of activeEvents) {
+              if (keepId === null || queued.id !== keepId) {
+                await dbDelete('changeQueue', queued.id);
+              }
+            }
+          };
+
+          // A conflict/held item must not be reactivated by ordinary typing or import.
+          // Remove active duplicates so Push cannot process stale events for that ID.
+          if (conflictEvent) {
+            await removeExtraActiveEvents();
+            return conflictEvent;
+          }
+          if (heldEvent) {
+            await removeExtraActiveEvents();
+            return heldEvent;
+          }
+
+          // If old versions already contain duplicate pending entries, use one
+          // canonical event. Prefer create so an unsynced record is not treated as
+          // several independent cloud writes.
+          const existing = activeEvents.find(item => item.operation === 'create') ||
+            activeEvents.find(item => item.operation === 'update') ||
+            activeEvents.find(item => item.operation === 'delete') || null;
 
           if (existing) {
-            if (existing.status === 'held') {
-              // Pertahankan status held pada artefak lama; jangan aktifkan kembali menjadi pending
-              return existing;
-            }
-            if (existing.status === 'conflict') {
-              // Konflik hanya boleh diselesaikan melalui ConflictManager, bukan record() biasa.
-              return existing;
-            }
             if (existing.operation === 'create') {
               if (operation === 'delete') {
                 const item = await dbGet(entity, entityId);
                 if (!item || (!item.version && !item.baseVersion)) {
-                  await dbDelete('changeQueue', existing.id);
+                  await removeExtraActiveEvents();
                   return null;
-                } else {
-                  existing.operation = 'delete';
-                  existing.timestamp = new Date().toISOString();
-                  existing.status = 'pending';
-                  delete existing.conflictReason;
-                  delete existing.lastError;
-                  await dbPut('changeQueue', existing);
-                  return existing;
                 }
-              } else {
-                existing.timestamp = new Date().toISOString();
-                existing.status = 'pending';
-                delete existing.conflictReason;
-                delete existing.lastError;
-                await dbPut('changeQueue', existing);
-                return existing;
-              }
-            } else if (existing.operation === 'update') {
-              if (operation === 'delete') {
                 existing.operation = 'delete';
               }
               existing.timestamp = new Date().toISOString();
@@ -1857,8 +1888,23 @@
               delete existing.conflictReason;
               delete existing.lastError;
               await dbPut('changeQueue', existing);
+              await removeExtraActiveEvents(existing.id);
               return existing;
-            } else if (existing.operation === 'delete') {
+            }
+
+            if (existing.operation === 'update') {
+              if (operation === 'delete') existing.operation = 'delete';
+              existing.timestamp = new Date().toISOString();
+              existing.status = 'pending';
+              delete existing.conflictReason;
+              delete existing.lastError;
+              await dbPut('changeQueue', existing);
+              await removeExtraActiveEvents(existing.id);
+              return existing;
+            }
+
+            if (existing.operation === 'delete') {
+              await removeExtraActiveEvents(existing.id);
               delete existing.conflictReason;
               delete existing.lastError;
               return existing;
@@ -1889,6 +1935,14 @@
           await dbPut('changeQueue', record);
           return record;
         } catch (e) {
+          const failureKey = `${entity}:${String(entityId)}`;
+          this.lastRecordFailure = {
+            key: failureKey,
+            entity,
+            entityId: String(entityId),
+            message: e && e.message ? e.message : String(e),
+            at: new Date().toISOString()
+          };
           console.warn('[ChangeTracker] Gagal mencatat perubahan:', e);
           return null;
         }
@@ -1906,6 +1960,86 @@
           if (!entity) return true;
           return item.entity === entity;
         });
+      },
+
+      async consolidatePendingEvents() {
+        // One active outbox event per entity+ID. Keep conflict/held records intact.
+        const all = (await dbGetAll('changeQueue')) || [];
+        const groups = new Map();
+        const protectedKeys = new Set(
+          all.filter(item => item.status === 'conflict' || item.status === 'held')
+            .map(item => `${item.entity}:${String(item.entityId)}`)
+        );
+        for (const item of all) {
+          if (item.status !== 'pending' && item.status !== 'failed') continue;
+          const key = `${item.entity}:${String(item.entityId)}`;
+          if (!groups.has(key)) groups.set(key, []);
+          groups.get(key).push(item);
+        }
+
+        let removedCount = 0;
+        for (const [key, group] of groups.entries()) {
+          // Conflict and intentionally-held records must not have parallel active
+          // events that a later Push could accidentally pick up.
+          if (protectedKeys.has(key)) {
+            for (const queued of group) {
+              await dbDelete('changeQueue', queued.id);
+              removedCount++;
+            }
+            continue;
+          }
+          if (group.length < 2) continue;
+          const first = group[0];
+          const storeName = first.entity === 'notes' ? 'notes' : 'folders';
+          const localItem = await dbGet(storeName, first.entityId);
+
+          // A locally-created record deleted before its first cloud upload needs no
+          // tombstone. This mirrors the existing create-then-delete cancellation rule.
+          if (localItem && localItem.deleted_at && !localItem.version && !localItem.baseVersion) {
+            for (const queued of group) {
+              await dbDelete('changeQueue', queued.id);
+              removedCount++;
+            }
+            continue;
+          }
+
+          let canonicalOperation;
+          if (localItem && localItem.deleted_at) {
+            canonicalOperation = 'delete';
+          } else if (group.some(item => item.operation === 'create')) {
+            canonicalOperation = 'create';
+          } else if (group.some(item => item.operation === 'update')) {
+            canonicalOperation = 'update';
+          } else {
+            canonicalOperation = group[0].operation;
+          }
+
+          const sorted = [...group].sort((a, b) => {
+            const statusPriority = item => item.status === 'pending' ? 1 : 0;
+            const opPriority = item => item.operation === canonicalOperation ? 1 : 0;
+            return opPriority(b) - opPriority(a) || statusPriority(b) - statusPriority(a) ||
+              (new Date(b.timestamp || 0).getTime() - new Date(a.timestamp || 0).getTime());
+          });
+          const canonical = sorted[0];
+          canonical.operation = canonicalOperation;
+          canonical.status = group.some(item => item.status === 'pending') ? 'pending' : 'failed';
+          canonical.timestamp = sorted[0].timestamp || new Date().toISOString();
+          if (canonical.status === 'pending') {
+            delete canonical.lastError;
+          }
+          await dbPut('changeQueue', canonical);
+
+          for (const queued of group) {
+            if (queued.id !== canonical.id) {
+              await dbDelete('changeQueue', queued.id);
+              removedCount++;
+            }
+          }
+        }
+        if (removedCount > 0) {
+          console.info(`[ChangeTracker] Consolidated ${removedCount} duplicate active queue event(s).`);
+        }
+        return removedCount;
       },
 
       async markSynced(id) {
@@ -1975,6 +2109,41 @@
         dId = 'ft_dev_offline';
       }
       return dId;
+    }
+
+    // Load the cloud SDK only when local UI startup has finished.
+    // The initial notes screen must not wait for the Supabase CDN.
+    let supabaseSdkLoadPromise = null;
+
+    function ensureSupabaseSdkLoaded() {
+      if (window.supabase && typeof window.supabase.createClient === 'function') {
+        return Promise.resolve(window.supabase);
+      }
+      if (supabaseSdkLoadPromise) return supabaseSdkLoadPromise;
+
+      supabaseSdkLoadPromise = new Promise((resolve, reject) => {
+        const script = document.createElement('script');
+        script.src = 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2';
+        script.async = true;
+        script.dataset.foldtextSupabaseSdk = 'true';
+        script.onload = () => {
+          if (window.supabase && typeof window.supabase.createClient === 'function') {
+            resolve(window.supabase);
+          } else {
+            reject(new Error('SDK Supabase selesai dimuat tetapi createClient tidak tersedia.'));
+          }
+        };
+        script.onerror = () => {
+          script.remove();
+          reject(new Error('SDK Supabase tidak dapat dimuat dari CDN.'));
+        };
+        document.head.appendChild(script);
+      }).catch(error => {
+        supabaseSdkLoadPromise = null;
+        throw error;
+      });
+
+      return supabaseSdkLoadPromise;
     }
 
     const AuthManager = {
@@ -2075,6 +2244,18 @@
         const config = this.getConfig();
         if (!config.isConfigured) {
           this.authStatus = 'unconfigured';
+          this.renderUI();
+          return;
+        }
+
+        // This runs after the local notes screen has rendered. Loading the cloud
+        // SDK here keeps network/CDN latency out of the critical startup path.
+        try {
+          await ensureSupabaseSdkLoaded();
+        } catch (sdkError) {
+          console.warn('[FoldText Auth] SDK Supabase belum tersedia:', sdkError);
+          this.authStatus = 'offline';
+          this.lastError = 'Fitur cloud belum tersedia. Catatan lokal tetap bisa digunakan.';
           this.renderUI();
           return;
         }
@@ -3842,9 +4023,13 @@ Daftar Tugas Contoh:
             continue;
           } else {
             if (!localFolder || Number(cf.version || 1) > Number(localFolder.version || 0) || new Date(cf.updated_at).getTime() > Number(localFolder.updated_at || 0)) {
+              const wasApplyingRemoteChange = isApplyingRemoteChange;
               isApplyingRemoteChange = true;
-              await dbPut('folders', cloudToLocalFolder(cf));
-              isApplyingRemoteChange = false;
+              try {
+                await dbPut('folders', cloudToLocalFolder(cf));
+              } finally {
+                isApplyingRemoteChange = wasApplyingRemoteChange;
+              }
             }
           }
         }
@@ -3889,9 +4074,13 @@ Daftar Tugas Contoh:
             continue;
           } else {
             if (!localNote || Number(cn.version || 1) > Number(localNote.version || 0) || new Date(cn.updated_at).getTime() > Number(localNote.updated_at || 0)) {
+              const wasApplyingRemoteChange = isApplyingRemoteChange;
               isApplyingRemoteChange = true;
-              await dbPut('notes', cloudToLocalNote(cn));
-              isApplyingRemoteChange = false;
+              try {
+                await dbPut('notes', cloudToLocalNote(cn));
+              } finally {
+                isApplyingRemoteChange = wasApplyingRemoteChange;
+              }
             }
           }
         }
@@ -3960,6 +4149,10 @@ Daftar Tugas Contoh:
       },
 
       async _executePush(user, client) {
+        // Repair duplicate active outbox entries created by older builds/imports before
+        // taking the batch snapshot. This does not modify Cloud data by itself.
+        await ChangeTracker.consolidatePendingEvents();
+
         let pushSuccessCount = 0;
         let pushFailedCount = 0;
         let pushConflictCount = 0;
@@ -4360,29 +4553,41 @@ Daftar Tugas Contoh:
 
           // 1. Tarik dari cloud terlebih dahulu untuk rekonsiliasi awal
           await this._executePull(pre.user, pre.client);
+          const pullCompletedAt = new Date().toISOString();
+          this.lastPullAt = pullCompletedAt;
+          await dbPut('metadata', { key: 'last_pull_time', value: pullCompletedAt });
+
           // 2. Masukkan data lokal ke antrean
           await this.queueAllLocalDataForInitialSync();
           // 3. Kirim ke cloud
           const { pushSuccessCount, pushFailedCount, pushConflictCount } = await this._executePush(pre.user, pre.client);
 
-          const now = new Date().toISOString();
-          this.lastPullAt = now;
-          this.lastPushAt = now;
-          this.lastSyncAt = now;
-          await Promise.all([
-            dbPut('metadata', { key: 'last_pull_time', value: now }),
-            dbPut('metadata', { key: 'last_push_time', value: now }),
-            dbPut('metadata', { key: 'last_sync_time', value: now })
-          ]);
-          this.syncStatus = 'idle';
+          const attemptAt = new Date().toISOString();
+          this.lastPushAt = attemptAt;
+          await dbPut('metadata', { key: 'last_push_time', value: attemptAt });
 
-          if (isManual) {
-            if (ConflictManager.getConflictCount() > 0) {
-              showToast(`⚠️ Tautan selesai. Terdapat ${ConflictManager.getConflictCount()} konflik data belum diputuskan.`, 'warning');
-              ConflictManager.openDialog();
-            } else {
-              showToast('✓ Rekonsiliasi awal cloud berhasil!');
+          const unresolvedConflicts = ConflictManager.getConflictCount();
+          if (pushFailedCount > 0) {
+            // Preserve pending/failed queue items for an explicit retry; do not mark the
+            // initial reconciliation as clean just because the overall function returned.
+            this.syncStatus = 'error';
+            if (isManual) {
+              showToast(`⚠️ Rekonsiliasi awal belum lengkap: ${pushSuccessCount} terkirim, ${pushFailedCount} gagal, ${pushConflictCount} konflik. Item gagal tetap lokal/di antrean untuk dicoba lagi.`, 'warning');
             }
+          } else if (pushConflictCount > 0 || unresolvedConflicts > 0) {
+            this.syncStatus = 'idle';
+            if (isManual) {
+              showToast(`⚠️ Rekonsiliasi awal selesai dengan ${Math.max(pushConflictCount, unresolvedConflicts)} konflik yang perlu diputuskan. ${pushSuccessCount} perubahan berhasil dikirim.`, 'warning');
+            }
+          } else {
+            this.syncStatus = 'idle';
+            this.lastSyncAt = attemptAt;
+            await dbPut('metadata', { key: 'last_sync_time', value: attemptAt });
+            if (isManual) showToast('✓ Rekonsiliasi awal cloud berhasil!');
+          }
+
+          if (unresolvedConflicts > 0 || pushConflictCount > 0) {
+            ConflictManager.openDialog();
           }
         } catch (err) {
           console.error('[SyncManager] Error bootstrapSync:', err);
@@ -4606,6 +4811,13 @@ Daftar Tugas Contoh:
     const statWords = document.getElementById('stat-words');
     const statChars = document.getElementById('stat-chars');
 
+    // Keep the performance-only changes scoped to the hosted GitHub Pages PWA.
+    // The packaged Android app shares this HTML source but must retain its existing runtime.
+    function isGitHubPagesRuntime() {
+      return window.location.hostname === 'fiqx23.github.io' &&
+        window.location.pathname.startsWith('/foldtext-app/');
+    }
+
     async function initApp() {
       await openDB();
       initTheme();
@@ -4643,10 +4855,6 @@ Daftar Tugas Contoh:
         notes.push(welcomeNote);
       }
 
-      // Inisialisasi Conflict & Sync Engine
-      await ConflictManager.init();
-      await SyncManager.init();
-
       // Sort notes by updated_at descending
       notes.sort((a, b) => b.updated_at - a.updated_at);
 
@@ -4658,6 +4866,23 @@ Daftar Tugas Contoh:
         selectNote(notes[0].id);
       }
 
+      // Startup priority: show the local notes UI first. Conflict/sync metadata is
+      // background work and must not block the first usable screen.
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          // Finish local-only status work first, then initialize cloud auth.
+          // This gives the first usable notes screen priority over SDK loading.
+          ConflictManager.init()
+            .then(() => SyncManager.init())
+            .catch(error => {
+              console.warn('[FoldText Startup] Gagal memuat status konflik/sinkronisasi:', error);
+            })
+            .finally(() => {
+              if (isGitHubPagesRuntime()) AuthManager.init();
+            });
+        });
+      });
+
       // Pasang event listener status jaringan (Manual Cloud Sync only)
       window.addEventListener('online', () => {
         showToast('🌐 Terhubung kembali ke jaringan.', 'info');
@@ -4668,8 +4893,8 @@ Daftar Tugas Contoh:
         if (typeof SyncManager !== 'undefined') SyncManager.updateStatusUI();
       });
 
-      // Inisialisasi status sesi Cloud & Supabase Auth (Phase A & 2)
-      AuthManager.init();
+      // Keep the packaged/local runtime's existing auth initialization timing.
+      if (!isGitHubPagesRuntime()) AuthManager.init();
     }
 
     /* ==========================================================================
@@ -4760,6 +4985,7 @@ Daftar Tugas Contoh:
 
         const item = document.createElement('div');
         item.className = `note-item ${note.id === activeNoteId ? 'active' : ''}`;
+        item.dataset.noteId = String(note.id);
         item.title = 'Klik untuk membuka. Klik kanan / tahan untuk opsi.';
         item.onclick = () => {
           selectNote(note.id);
@@ -4821,9 +5047,20 @@ Daftar Tugas Contoh:
         renderSmartFolding();
       }
 
-      // Update UI active highlight
-      document.querySelectorAll('.note-item').forEach(el => el.classList.remove('active'));
-      renderNotesList();
+      if (isGitHubPagesRuntime()) {
+        // Update the active marker in place. Rebuilding the full notes list here
+        // recreated every row and its context-menu handlers on each note selection.
+        const previousActiveItem = notesListContainer.querySelector('.note-item.active');
+        if (previousActiveItem) previousActiveItem.classList.remove('active');
+
+        const nextActiveItem = Array.from(notesListContainer.querySelectorAll('.note-item'))
+          .find(el => el.dataset.noteId === String(noteId));
+        if (nextActiveItem) nextActiveItem.classList.add('active');
+      } else {
+        // Preserve existing behavior for packaged/local builds.
+        document.querySelectorAll('.note-item').forEach(el => el.classList.remove('active'));
+        renderNotesList();
+      }
     }
 
     async function createNewNote() {
@@ -4939,7 +5176,10 @@ Daftar Tugas Contoh:
       note.updated_at = Date.now();
 
       await dbPut('notes', note);
-      await ChangeTracker.record('notes', note.id, 'update');
+      const queueRecord = await ChangeTracker.record('notes', note.id, 'update');
+      if (queueRecord === null && !isApplyingRemoteChange) {
+        showToast('Catatan tersimpan di perangkat, tetapi antrean cloud gagal dicatat. Periksa penyimpanan lalu coba edit lagi sebelum menekan Kirim.', 'danger');
+      }
       // Re-sort notes
       notes.sort((a, b) => b.updated_at - a.updated_at);
       renderFolderChips();
@@ -5845,50 +6085,155 @@ Daftar Tugas Contoh:
 
     let deferredPrompt = null;
 
+    function isPWAStandalone() {
+      return window.matchMedia('(display-mode: standalone)').matches ||
+        window.navigator.standalone === true;
+    }
+
     function initPWA() {
-      // Daftarkan Service Worker setelah seluruh halaman selesai dimuat
-      if ('serviceWorker' in navigator && (window.location.protocol.startsWith('http') || window.location.hostname === 'localhost')) {
-        window.addEventListener('load', () => {
-          navigator.serviceWorker.register('./sw.js', { scope: './' })
-            .then((reg) => {
-              console.log('[PWA] Service Worker terdaftar. Scope:', reg.scope);
-            })
-            .catch((err) => {
-              console.warn('[PWA] Gagal mendaftarkan Service Worker:', err);
-            });
-        });
+      const installBtn = document.getElementById('pwa-install-btn');
+      if (installBtn) {
+        installBtn.style.display = isPWAStandalone() ? 'none' : 'inline-flex';
       }
 
-      // Simpan event instalasi dan aktifkan tombol '📲 Pasang'
-      window.addEventListener('beforeinstallprompt', (e) => {
-        e.preventDefault();
-        deferredPrompt = e;
-        const installBtn = document.getElementById('pwa-install-btn');
-        if (installBtn) installBtn.style.display = 'inline-flex';
+      // GitHub Pages uses a repository subpath (for example /foldtext-app/).
+      // Resolve paths from the current page instead of assuming the domain root.
+      if (
+        'serviceWorker' in navigator &&
+        (window.location.protocol === 'https:' || window.location.hostname === 'localhost')
+      ) {
+        const workerUrl = new URL('./sw.js', document.baseURI);
+        const appScopeUrl = new URL('./', document.baseURI);
+        navigator.serviceWorker.getRegistration(appScopeUrl.href)
+          .then(registration => {
+            if (!registration) {
+              // First visit: register immediately so the offline shell can be cached.
+              return navigator.serviceWorker.register(workerUrl.href, { scope: appScopeUrl.pathname });
+            }
+
+            // Existing installs keep using their cache-first shell. Check for updates
+            // after the app has had time to render instead of on the critical path.
+            const checkForUpdate = () => registration.update().catch(() => {});
+            if ('requestIdleCallback' in window) {
+              window.requestIdleCallback(checkForUpdate, { timeout: 5000 });
+            } else {
+              window.setTimeout(checkForUpdate, 1500);
+            }
+            return registration;
+          })
+          .catch(error => {
+            console.warn('[FoldText PWA] Service worker belum aktif:', error);
+          });
+      }
+
+      window.addEventListener('beforeinstallprompt', event => {
+        event.preventDefault();
+        deferredPrompt = event;
+        if (installBtn && !isPWAStandalone()) {
+          installBtn.style.display = 'inline-flex';
+          installBtn.title = 'Pasang FoldText Lite';
+        }
       });
 
-      // Hilangkan tombol otomatis saat aplikasi sudah terpasang
       window.addEventListener('appinstalled', () => {
         deferredPrompt = null;
-        const installBtn = document.getElementById('pwa-install-btn');
         if (installBtn) installBtn.style.display = 'none';
-        showToast('🎉 FoldText berhasil dipasang!');
+        showToast('✓ FoldText Lite berhasil dipasang!');
       });
+    }
+
+    function getInstallGuidance() {
+      const ua = navigator.userAgent || '';
+      const platform = navigator.platform || '';
+      const isIOS = /iPad|iPhone|iPod/i.test(ua) ||
+        (platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+      const isAndroid = /Android/i.test(ua);
+      const isSamsung = /SamsungBrowser/i.test(ua);
+      const isFirefox = /Firefox|FxiOS/i.test(ua);
+      const isEdge = /EdgA|EdgiOS|Edg\//i.test(ua);
+      const isOpera = /OPR|Opera/i.test(ua);
+      const isChrome = /Chrome|CriOS|Chromium/i.test(ua) && !isEdge && !isOpera;
+      const isSafari = /Safari/i.test(ua) &&
+        !/(Chrome|CriOS|Chromium|Edg|Firefox|FxiOS|OPR|Opera|SamsungBrowser)/i.test(ua);
+
+      const intro = 'Browser ini tidak menyediakan dialog pemasangan langsung dari tombol halaman. Coba langkah berikut:';
+      if (isIOS) {
+        return intro + '\n\n' +
+          'iPhone/iPad: buka menu Bagikan (Share) → Tambahkan ke Layar Utama (Add to Home Screen) → Tambah. Jika pilihan itu tidak tersedia, buka situs ini di Safari lalu ulangi.';
+      }
+      if (isAndroid && isSamsung) {
+        return intro + '\n\n' +
+          'Samsung Internet: buka menu ☰ → Add page to / Tambahkan halaman ke → Home screen / Layar utama. Nama menu dapat berbeda menurut versi browser.';
+      }
+      if (isAndroid && isFirefox) {
+        return intro + '\n\n' +
+          'Firefox Android: buka menu ⋮, lalu pilih Install / Pasang atau Add to Home screen / Tambahkan ke layar utama jika tersedia.';
+      }
+      if (isAndroid && isEdge) {
+        return intro + '\n\n' +
+          'Edge Android: buka menu ⋯, lalu cari Install / Pasang atau Add to phone / Tambahkan ke layar utama.';
+      }
+      if (isAndroid && isChrome) {
+        return intro + '\n\n' +
+          'Chrome Android: buka menu ⋮ → Install app / Pasang aplikasi. Jika pilihan itu tidak ada, coba Tambahkan ke layar utama. Buka situs saat online dan muat ulang terlebih dahulu.';
+      }
+      if (isAndroid) {
+        return intro + '\n\n' +
+          'Android: buka menu browser dan cari Install app / Pasang aplikasi atau Add to Home screen / Tambahkan ke layar utama. Jika tidak ada, coba Chrome atau Samsung Internet.';
+      }
+      if (isSafari && /Macintosh|Mac OS X/i.test(ua)) {
+        return intro + '\n\n' +
+          'Safari di macOS Sonoma atau lebih baru: pilih File → Add to Dock / Tambahkan ke Dock.';
+      }
+      if (isEdge) {
+        return intro + '\n\n' +
+          'Microsoft Edge: buka menu ⋯ → Apps / Aplikasi → Install this site as an app / Instal situs ini sebagai aplikasi.';
+      }
+      if (isChrome) {
+        return intro + '\n\n' +
+          'Chrome desktop: cari ikon Install di bilah alamat atau buka menu ⋮ dan cari Install page as app / Pasang halaman sebagai aplikasi. Jika opsi tidak ada, periksa status PWA di DevTools → Application.';
+      }
+      if (isFirefox) {
+        return 'Firefox desktop belum menyediakan pemasangan PWA bawaan melalui web manifest. Gunakan Chrome atau Edge untuk memasang FoldText sebagai aplikasi; di Firefox, situs tetap dapat disimpan sebagai bookmark.';
+      }
+      return intro + '\n\n' +
+        'Buka menu browser dan cari opsi Install app / Pasang aplikasi atau Add to Home screen / Tambahkan ke layar utama. Jika opsi itu tidak tersedia pada desktop, gunakan Chrome/Edge; pada iPhone/iPad, gunakan menu Bagikan.';
     }
 
     async function installPWA() {
-      if (!deferredPrompt) {
-        showToast('Aplikasi sudah terpasang atau gunakan menu browser.');
+      const installBtn = document.getElementById('pwa-install-btn');
+
+      if (isPWAStandalone()) {
+        showToast('FoldText Lite sudah berjalan sebagai aplikasi.');
+        if (installBtn) installBtn.style.display = 'none';
         return;
       }
-      deferredPrompt.prompt();
-      const { outcome } = await deferredPrompt.userChoice;
-      if (outcome === 'accepted') {
-        deferredPrompt = null;
-        const installBtn = document.getElementById('pwa-install-btn');
-        if (installBtn) installBtn.style.display = 'none';
+
+      if (!deferredPrompt) {
+        window.alert(getInstallGuidance());
+        return;
+      }
+
+      const promptEvent = deferredPrompt;
+      deferredPrompt = null;
+
+      try {
+        await promptEvent.prompt();
+        const choice = await promptEvent.userChoice;
+
+        if (choice && choice.outcome === 'accepted') {
+          if (installBtn) installBtn.style.display = 'none';
+          showToast('✓ Permintaan pemasangan FoldText Lite diterima.');
+        } else {
+          if (installBtn) installBtn.style.display = 'inline-flex';
+          showToast('Pemasangan dibatalkan.');
+        }
+      } catch (error) {
+        console.warn('[FoldText PWA] Prompt pemasangan tidak tersedia:', error);
+        window.alert(getInstallGuidance());
       }
     }
+
     /* ==========================================================================
        10. KEYBOARD SHORTCUTS & TAB INDENT
        ========================================================================== */
