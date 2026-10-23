@@ -5,7 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <meta name="description" content="FoldText Lite - Aplikasi Catatan Personal Ultra-Ringan dengan Hierarki Folder & Smart Folding">
   <!-- PWA Meta & Manifest -->
-  <link id="manifest-placeholder" rel="manifest">
+ <link rel="manifest" href="./manifest.json">
+<link rel="icon" type="image/svg+xml" href="./icon.svg">
+<link rel="apple-touch-icon" href="./icon.svg">
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -5843,17 +5845,20 @@ Daftar Tugas Contoh:
 
     let deferredPrompt = null;
 
-    function initPWA() {
-      const currentFileName = window.location.pathname.split('/').pop() || './';
-      const manifestData = {
-        name: "FoldText Lite",
-        short_name: "FoldText",
-        description: "Aplikasi Catatan Personal Ultra-Ringan dengan Hierarki Folder & Smart Folding",
-        start_url: currentFileName,
-        display: "standalone",
-        background_color: "#0b0f19",
-        theme_color: "#6366f1",
-        icons: [
+   function initPWA() {
+  if ('serviceWorker' in navigator && (window.location.protocol.startsWith('http') || window.location.hostname === 'localhost')) {
+    navigator.serviceWorker.register('./sw.js').catch((err) => {
+      console.warn('[PWA] Service Worker gagal didaftarkan:', err);
+    });
+  }
+
+  window.addEventListener('beforeinstallprompt', (e) => {
+    e.preventDefault();
+    deferredPrompt = e;
+    const installBtn = document.getElementById('pwa-install-btn');
+    if (installBtn) installBtn.style.display = 'inline-flex';
+  });
+}
           {
             src: "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%236366f1'/><text y='.7em' x='50%' text-anchor='middle' font-size='60'>📑</text></svg>",
             sizes: "192x192 512x512",
