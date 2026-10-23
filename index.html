@@ -5845,59 +5845,71 @@ Daftar Tugas Contoh:
 
     let deferredPrompt = null;
 
-   function initPWA() {
+   let deferredPrompt = null;
+
+function initPWA() {
+  // 1. Registrasi Service Worker dengan scope relatif
   if ('serviceWorker' in navigator && (window.location.protocol.startsWith('http') || window.location.hostname === 'localhost')) {
-    navigator.serviceWorker.register('./sw.js').catch((err) => {
-      console.warn('[PWA] Service Worker gagal didaftarkan:', err);
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('./sw.js', { scope: './' })
+        .then((reg) => {
+          console.log('[PWA] Service Worker aktif. Scope:', reg.scope);
+        })
+        .catch((err) => {
+          console.warn('[PWA] Pendaftaran Service Worker gagal:', err);
+        });
     });
   }
 
+  // 2. Tangkap event instalasi browser (Android/Desktop)
   window.addEventListener('beforeinstallprompt', (e) => {
+    // Cegah mini-infobar default browser agar tombol custom Anda bekerja
     e.preventDefault();
     deferredPrompt = e;
+
+    // Tampilkan tombol pasang di sidebar
     const installBtn = document.getElementById('pwa-install-btn');
-    if (installBtn) installBtn.style.display = 'inline-flex';
+    if (installBtn) {
+      installBtn.style.display = 'inline-flex';
+    }
+  });
+
+  // 3. Sembunyikan tombol jika aplikasi sudah terpasang
+  window.addEventListener('appinstalled', () => {
+    deferredPrompt = null;
+    const installBtn = document.getElementById('pwa-install-btn');
+    if (installBtn) {
+      installBtn.style.display = 'none';
+    }
+    showToast('🎉 FoldText berhasil dipasang di perangkat!');
   });
 }
-          {
-            src: "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%236366f1'/><text y='.7em' x='50%' text-anchor='middle' font-size='60'>📑</text></svg>",
-            sizes: "192x192 512x512",
-            type: "image/svg+xml"
-          }
-        ]
-      };
 
-      const manifestBlob = new Blob([JSON.stringify(manifestData)], { type: 'application/json' });
-      const manifestLink = document.getElementById('manifest-placeholder');
-      if (manifestLink) {
-        manifestLink.setAttribute('href', URL.createObjectURL(manifestBlob));
-      }
+// Handler tombol klik '📲 Pasang'
+async function installPWA() {
+  if (!deferredPrompt) {
+    showToast('Aplikasi sudah terpasang atau browser tidak mendukung auto-install.');
+    return;
+  }
 
-      if ('serviceWorker' in navigator && window.location.protocol.startsWith('http')) {
-        navigator.serviceWorker.register('./sw.js').catch(() => {
-          // sw.js optional if deployed on web server
-        });
-      }
+  // Tampilkan prompt bawaan sistem
+  deferredPrompt.prompt();
 
-      window.addEventListener('beforeinstallprompt', (e) => {
-        e.preventDefault();
-        deferredPrompt = e;
-        const installBtn = document.getElementById('pwa-install-btn');
-        if (installBtn) installBtn.style.display = 'inline-flex';
-      });
-    }
+  // Tunggu keputusan pengguna
+  const { outcome } = await deferredPrompt.userChoice;
+  if (outcome === 'accepted') {
+    console.log('[PWA] Pengguna menyetujui instalasi.');
+  } else {
+    console.log('[PWA] Pengguna membatalkan instalasi.');
+  }
 
-    function installPWA() {
-      if (deferredPrompt) {
-        deferredPrompt.prompt();
-        deferredPrompt.userChoice.then(() => {
-          deferredPrompt = null;
-          const installBtn = document.getElementById('pwa-install-btn');
-          if (installBtn) installBtn.style.display = 'none';
-        });
-      }
-    }
-
+  // Reset prompt agar tidak memory leak
+  deferredPrompt = null;
+  const installBtn = document.getElementById('pwa-install-btn');
+  if (installBtn) {
+    installBtn.style.display = 'none';
+  }
+}
     /* ==========================================================================
        10. KEYBOARD SHORTCUTS & TAB INDENT
        ========================================================================== */
